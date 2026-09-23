@@ -30,13 +30,23 @@ var isRightCommandDown = false
 var isEnabled = true
 var audioRecorder: AVAudioRecorder?
 var recordingURL: URL?
+var recordingTargetPID: pid_t?
 var statusItem: NSStatusItem!
 var eventTap: CFMachPort?
 var tapRunLoopSource: CFRunLoopSource?
 var tapHealthTimer: Timer?
+var globalKeyMonitor: Any?
+var localKeyMonitor: Any?
 var downloadSession: URLSessionDownloadTask?
 var isDownloading = false
 var selectedModel: Model = .medium
+var activityWindow: PrefsWindow?
+
+func showActivity(_ message: String, color: NSColor = .labelColor) {
+    activityWindow?.activityLabel?.stringValue = message
+    activityWindow?.activityLabel?.textColor = color
+    activityWindow?.refreshPermissions()
+}
 
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 let appSupport = home + "/.whispermac"
@@ -93,12 +103,14 @@ func startRecording() {
     guard !isTranscribing else { return }
     guard FileManager.default.fileExists(atPath: whisperBinPath), modelExists() else {
         logDiagnostic("recording unavailable: CLI or model missing")
+        showActivity("Model or whisper-cli is missing", color: .systemRed)
         statusItem.button?.toolTip = "WhisperMac — Install whisper-cli and download a model in Preferences"
         playSound("Basso")
         return
     }
     guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
         logDiagnostic("recording unavailable: microphone access not granted")
+        showActivity("Allow microphone access in System Settings", color: .systemRed)
         statusItem.button?.toolTip = "WhisperMac — Allow microphone access in System Settings"
         playSound("Basso")
         return
@@ -108,18 +120,22 @@ func startRecording() {
 
     guard let recorder = try? AVAudioRecorder(url: url, settings: audioSettings) else {
         logDiagnostic("recording unavailable: AVAudioRecorder could not initialize")
+        showActivity("Could not initialize microphone", color: .systemRed)
         playSound("Basso")
         return
     }
     guard recorder.prepareToRecord(), recorder.record() else {
         logDiagnostic("recording unavailable: AVAudioRecorder could not start")
+        showActivity("Could not start recording", color: .systemRed)
         playSound("Basso")
         return
     }
     audioRecorder = recorder
     recordingURL = url
+    recordingTargetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
     isRecording = true
-    logDiagnostic("recording started")
+    logDiagnostic("recording started; target pid=\(recordingTargetPID.map(String.init) ?? "none")")
+    showActivity("Recording — release Right ⌘ to transcribe", color: .systemRed)
     playSound("Ping")
     setIcon("waveform.circle.fill")
     statusItem.button?.toolTip = "WhisperMac — Recording"
@@ -133,9 +149,12 @@ func stopAndTranscribe() {
     isRecording = false
     isTranscribing = true
     logDiagnostic("recording stopped; transcription started")
+    showActivity("Transcribing…", color: .systemOrange)
     setIcon("arrow.triangle.2.circlepath")
     statusItem.button?.toolTip = "WhisperMac — Transcribing"
     let chosenModelPath = modelPath
+    let originalTargetPID = recordingTargetPID
+    recordingTargetPID = nil
 
     DispatchQueue.global(qos: .userInitiated).async {
         let outputBase = FileManager.default.temporaryDirectory.appendingPathComponent("whispermac-\(UUID().uuidString)")
@@ -167,21 +186,31 @@ func stopAndTranscribe() {
             if let text = text, !text.isEmpty {
                 logDiagnostic("transcription produced text")
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
+                guard NSPasteboard.general.setString(text, forType: .string) else {
+                    logDiagnostic("pasteboard write failed")
+                    showActivity("Could not copy transcription", color: .systemRed)
+                    playSound("Basso")
+                    statusItem.button?.toolTip = "WhisperMac — Could not copy transcription"
+                    setIcon("waveform.circle")
+                    return
+                }
 
-                let source = CGEventSource(stateID: .combinedSessionState)
-                let down = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true)
-                down?.flags = .maskCommand
-                down?.post(tap: .cghidEventTap)
-
-                let up = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false)
-                up?.flags = .maskCommand
-                up?.post(tap: .cghidEventTap)
-
-                playSound("Glass")
-                statusItem.button?.toolTip = "WhisperMac — Hold Right ⌘ to record"
+                let focusedPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                let targetPID = focusedPID.flatMap { $0 == getpid() ? nil : $0 } ?? originalTargetPID
+                if let targetPID, targetPID != getpid(), postPaste(to: targetPID) {
+                    logDiagnostic("paste shortcut sent to focused app pid=\(targetPID)")
+                    showActivity("Text sent to the active app", color: .systemGreen)
+                    playSound("Glass")
+                    statusItem.button?.toolTip = "WhisperMac — Hold Right ⌘ to record"
+                } else {
+                    logDiagnostic("paste shortcut not sent; focused pid=\(focusedPID.map(String.init) ?? "none"), original pid=\(originalTargetPID.map(String.init) ?? "none"), post access=\(CGPreflightPostEventAccess())")
+                    showActivity("Text copied. Allow Accessibility for automatic paste.", color: .systemOrange)
+                    playSound("Basso")
+                    statusItem.button?.toolTip = "WhisperMac — Text copied, but automatic paste was blocked"
+                }
             } else {
                 logDiagnostic("transcription produced no text")
+                showActivity("No text recognized", color: .systemRed)
                 playSound("Basso")
                 statusItem.button?.toolTip = "WhisperMac — Transcription failed or no speech detected"
             }
@@ -190,23 +219,63 @@ func stopAndTranscribe() {
     }
 }
 
+func postPaste(to pid: pid_t) -> Bool {
+    // Post through the HID event stream so the key combination reaches the
+    // focused control (including web-based editors), rather than the app's
+    // outer process, which can ignore process-targeted keyboard events.
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+        logDiagnostic("paste skipped: target pid=\(pid) is no longer frontmost")
+        return false
+    }
+    let postAccess = CGPreflightPostEventAccess()
+    let axAccess = AXIsProcessTrusted()
+    guard axAccess else {
+        logDiagnostic("paste blocked: Accessibility access is not trusted; post access=\(postAccess)")
+        return false
+    }
+    let source = CGEventSource(stateID: .hidSystemState)
+    guard let down = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true),
+          let up = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false) else { return false }
+    down.flags = .maskCommand
+    up.flags = .maskCommand
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+    logDiagnostic("paste HID events posted; target pid=\(pid); post access=\(postAccess); AX trusted=\(axAccess)")
+    return true
+}
+
+func handleRightCommand(keyCode: UInt16, flags: UInt64, source: String) {
+    guard keyCode == rightCommandKeyCode else { return }
+    // The device-specific right Command bit distinguishes it from left Command.
+    let isDown = (flags & 0x10) != 0
+    guard isDown != isRightCommandDown else { return }
+    isRightCommandDown = isDown
+    logDiagnostic("right Command \(isDown ? "pressed" : "released") via \(source)")
+    if isDown && isEnabled && !isRecording && !isTranscribing {
+        startRecording()
+    } else if !isDown && isRecording {
+        stopAndTranscribe()
+    }
+}
+
 let callback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
-    } else if type == .flagsChanged && event.getIntegerValueField(.keyboardEventKeycode) == rightCommandKeyCode {
-        // The device-specific right Command bit distinguishes it from left Command.
-        let isDown = (event.flags.rawValue & 0x10) != 0
-        if isDown != isRightCommandDown {
-            isRightCommandDown = isDown
-            logDiagnostic("right Command \(isDown ? "pressed" : "released")")
-            if isDown && isEnabled && !isRecording && !isTranscribing {
-                startRecording()
-            } else if !isDown && isRecording {
-                stopAndTranscribe()
-            }
-        }
+    } else if type == .flagsChanged {
+        handleRightCommand(keyCode: UInt16(event.getIntegerValueField(.keyboardEventKeycode)), flags: event.flags.rawValue, source: "event tap")
     }
     return Unmanaged.passUnretained(event)
+}
+
+func setupKeyMonitors() {
+    globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { event in
+        handleRightCommand(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue), source: "global monitor")
+    }
+    localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
+        handleRightCommand(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue), source: "local monitor")
+        return event
+    }
+    logDiagnostic("NSEvent monitors connected: global=\(globalKeyMonitor != nil), local=\(localKeyMonitor != nil)")
 }
 
 func removeTap() {
@@ -219,7 +288,7 @@ func removeTap() {
 
 func createTap() -> Bool {
     removeTap()
-    isRightCommandDown = CGEventSource.keyState(.combinedSessionState, key: rightCommandKeyCode)
+    isRightCommandDown = (CGEventSource.flagsState(.combinedSessionState).rawValue & 0x10) != 0
     let mask = (1 << CGEventType.flagsChanged.rawValue)
     guard let tap = CGEvent.tapCreate(
         tap: .cgSessionEventTap,
@@ -238,33 +307,23 @@ func createTap() -> Bool {
 }
 
 func setupTap() {
-    guard CGPreflightListenEventAccess() else {
-        removeTap()
-        setIcon("exclamationmark.circle")
-        statusItem.button?.toolTip = "WhisperMac — Allow Input Monitoring in System Settings"
-        logDiagnostic("keyboard tap unavailable: Input Monitoring not granted")
-        return
-    }
     if createTap() {
-        logDiagnostic("keyboard tap connected")
+        logDiagnostic("keyboard tap connected; Input Monitoring preflight=\(CGPreflightListenEventAccess())")
+        showActivity("Ready — hold Right ⌘ to record", color: .systemGreen)
         if !isRecording && !isTranscribing { setIcon("waveform.circle") }
         statusItem.button?.toolTip = "WhisperMac — Hold Right ⌘ to record"
     } else {
-        logDiagnostic("keyboard tap unavailable: could not create tap")
+        let canListen = CGPreflightListenEventAccess()
+        logDiagnostic("keyboard tap unavailable: could not create tap; Input Monitoring preflight=\(canListen)")
+        showActivity("Shortcut unavailable — check Input Monitoring", color: .systemRed)
         setIcon("exclamationmark.circle")
-        statusItem.button?.toolTip = "WhisperMac — Need Accessibility permission"
+        statusItem.button?.toolTip = canListen
+            ? "WhisperMac — Could not connect keyboard shortcut"
+            : "WhisperMac — Allow Input Monitoring in System Settings"
     }
 }
 
 func checkTapHealth() {
-    if !CGPreflightListenEventAccess() {
-        if eventTap != nil { setupTap() }
-        return
-    }
-    if isRecording && !CGEventSource.keyState(.combinedSessionState, key: rightCommandKeyCode) {
-        isRightCommandDown = false
-        stopAndTranscribe()
-    }
     guard let tap = eventTap else {
         _ = createTap()
         if eventTap != nil {
@@ -365,6 +424,8 @@ class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
 
 class PrefsWindow: NSObject, NSWindowDelegate {
     var window: NSWindow!
+    var activityLabel: NSTextField!
+    var permissionsLabel: NSTextField!
     var modelPopup: NSPopUpButton!
     var downloadButton: NSButton!
     var progressBar: NSProgressIndicator!
@@ -374,10 +435,15 @@ class PrefsWindow: NSObject, NSWindowDelegate {
     private var downloadID: UUID?
 
     func show() {
-        if let w = window { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        if let w = window {
+            refreshPermissions()
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
 
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 280),
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 390),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false
         )
@@ -385,7 +451,42 @@ class PrefsWindow: NSObject, NSWindowDelegate {
         window.delegate = self
         window.center()
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 280))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 390))
+
+        activityLabel = NSTextField(labelWithString: eventTap == nil
+            ? "Shortcut unavailable — check Input Monitoring"
+            : "Ready — hold Right ⌘ to record")
+        activityLabel.frame = NSRect(x: 20, y: 349, width: 420, height: 22)
+        activityLabel.font = NSFont.boldSystemFont(ofSize: 13)
+        activityLabel.textColor = eventTap == nil ? .systemRed : .systemGreen
+        content.addSubview(activityLabel)
+
+        permissionsLabel = NSTextField(labelWithString: "")
+        permissionsLabel.frame = NSRect(x: 20, y: 320, width: 420, height: 20)
+        permissionsLabel.font = NSFont.systemFont(ofSize: 11)
+        permissionsLabel.textColor = .secondaryLabelColor
+        content.addSubview(permissionsLabel)
+
+        let retryButton = NSButton(frame: NSRect(x: 20, y: 282, width: 90, height: 28))
+        retryButton.title = "Retry"
+        retryButton.bezelStyle = .rounded
+        retryButton.target = self
+        retryButton.action = #selector(retryConnection)
+        content.addSubview(retryButton)
+
+        let inputButton = NSButton(frame: NSRect(x: 118, y: 282, width: 150, height: 28))
+        inputButton.title = "Input Monitoring"
+        inputButton.bezelStyle = .rounded
+        inputButton.target = self
+        inputButton.action = #selector(openInputMonitoring)
+        content.addSubview(inputButton)
+
+        let accessibilityButton = NSButton(frame: NSRect(x: 276, y: 282, width: 164, height: 28))
+        accessibilityButton.title = "Accessibility"
+        accessibilityButton.bezelStyle = .rounded
+        accessibilityButton.target = self
+        accessibilityButton.action = #selector(openAccessibility)
+        content.addSubview(accessibilityButton)
 
         let titleLabel = NSTextField(labelWithString: "Whisper Model")
         titleLabel.font = NSFont.boldSystemFont(ofSize: 13)
@@ -447,8 +548,30 @@ class PrefsWindow: NSObject, NSWindowDelegate {
         content.addSubview(infoLabel)
 
         window.contentView = content
+        refreshPermissions()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func refreshPermissions() {
+        guard let permissionsLabel else { return }
+        let keyboard = eventTap == nil ? "unavailable" : "connected"
+        let paste = AXIsProcessTrusted() ? "allowed" : "needs access"
+        let microphone = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized ? "allowed" : "needs access"
+        permissionsLabel.stringValue = "Shortcut: \(keyboard)   Paste: \(paste)   Mic: \(microphone)"
+    }
+
+    @objc func retryConnection() {
+        setupTap()
+        refreshPermissions()
+    }
+
+    @objc func openInputMonitoring() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!)
+    }
+
+    @objc func openAccessibility() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
 
     func updateStatus() {
@@ -560,9 +683,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? FileManager.default.createDirectory(atPath: modelsDir, withIntermediateDirectories: true, attributes: nil)
         loadPreferences()
+        activityWindow = prefs
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
-        logDiagnostic("app launched; model=\(selectedModel.filename); Input Monitoring=\(CGPreflightListenEventAccess()); microphone=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)")
+        logDiagnostic("app launched; model=\(selectedModel.filename); Input Monitoring=\(CGPreflightListenEventAccess()); post access=\(CGPreflightPostEventAccess()); microphone=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)")
         if !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
+        if !CGPreflightPostEventAccess() { _ = CGRequestPostEventAccess() }
 
         statusItem = NSStatusBar.system.statusItem(withLength: 24)
         setIcon("waveform.circle")
@@ -589,12 +714,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
 
         setupTap()
+        setupKeyMonitors()
         tapHealthTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in checkTapHealth() }
+        prefs.show()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        prefs.show()
+        return true
     }
 }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
+app.applicationIconImage = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "WhisperMac")
 app.run()

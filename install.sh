@@ -151,8 +151,6 @@ cat > "build/WhisperMac.app/Contents/Info.plist" << 'PLIST'
     <string>WhisperMac needs microphone access to transcribe your voice.</string>
     <key>NSSupportsAutomaticTermination</key>
     <false/>
-    <key>LSUIElement</key>
-    <true/>
 </dict>
 </plist>
 PLIST
@@ -228,9 +226,10 @@ EOF
 
 launchctl enable "$SERVICE_TARGET"
 if ! launchctl bootstrap gui/"$(id -u)" "$PLIST_PATH"; then
-    echo "The app was installed, but macOS did not start its login agent." >&2
-    echo "Run 'launchctl bootstrap gui/$(id -u) $PLIST_PATH' from Terminal or log out and back in." >&2
-    exit 1
+    echo "The login agent could not start in this session; trying to open WhisperMac normally." >&2
+    if ! open /Applications/WhisperMac.app; then
+        echo "Open /Applications/WhisperMac.app in Finder. The login agent remains installed for the next login." >&2
+    fi
 fi
 
 echo ""
@@ -248,7 +247,7 @@ echo "  Logs:     $WHISPERMAC_DIR/stdout.log and stderr.log"
 echo ""
 echo "=== USAGE ==="
 echo "  Hold Right ⌘ → speak → release → text appears"
-echo "  Click menu bar icon → Preferences → change model"
+echo "  Open WhisperMac from the Dock → see status or change model"
 echo "  Cmd+, = open Preferences"
 echo ""
 echo "=== PERMISSIONS (one time) ==="
