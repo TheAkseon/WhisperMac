@@ -1,8 +1,9 @@
 import Cocoa
 import AVFoundation
 
-let rightCommandKeyCode: UInt16 = 0x36
 let vKeyCode: UInt16 = 0x09
+// Leave CPU capacity for the foreground app while whisper.cpp transcribes.
+let transcriptionThreadCount = 2
 
 struct Model: CaseIterable {
     let name: String
@@ -26,17 +27,12 @@ struct Model: CaseIterable {
 
 var isRecording = false
 var isTranscribing = false
-var isRightCommandDown = false
 var isEnabled = true
 var audioRecorder: AVAudioRecorder?
 var recordingURL: URL?
 var recordingTargetPID: pid_t?
 var statusItem: NSStatusItem!
-var eventTap: CFMachPort?
-var tapRunLoopSource: CFRunLoopSource?
-var tapHealthTimer: Timer?
-var globalKeyMonitor: Any?
-var localKeyMonitor: Any?
+let keyboardMonitor = KeyboardMonitor(onChange: handleRightCommand)
 var downloadSession: URLSessionDownloadTask?
 var isDownloading = false
 var selectedModel: Model = .medium
@@ -68,8 +64,34 @@ func logDiagnostic(_ message: String) {
         try? handle.write(contentsOf: data)
     }
 }
-var whisperBinPath: String {
+// Count only this process's registrations, without reading keyboard events.
+// This runs outside the input/UI path and records no dictated text.
+func logKeyboardResources(_ context: String) {
+    diagnosticQueue.async {
+        var count: UInt32 = 0
+        var result = CGGetEventTapList(0, nil, &count)
+        guard result == .success else {
+            logDiagnostic("keyboard resources \(context): unavailable (\(result.rawValue))")
+            return
+        }
+        let capacity = count + 8
+        var taps = [CGEventTapInformation](repeating: CGEventTapInformation(), count: Int(capacity))
+        result = CGGetEventTapList(capacity, &taps, &count)
+        guard result == .success else { return }
+        let owned = taps.prefix(min(Int(count), taps.count)).filter { $0.tappingProcess == getpid() }
+        logDiagnostic("keyboard resources \(context): owned taps=\(owned.count), enabled=\(owned.filter { $0.enabled }.count)")
+    }
+}
+
+let externalWhisperBinPath = appSupport + "/bin/whisper-cli"
+var bundledWhisperBinPath: String {
     (Bundle.main.resourcePath ?? "") + "/whisper-cli"
+}
+
+var whisperBinPath: String {
+    FileManager.default.isExecutableFile(atPath: externalWhisperBinPath)
+        ? externalWhisperBinPath
+        : bundledWhisperBinPath
 }
 
 var modelPath: String {
@@ -162,25 +184,38 @@ func stopAndTranscribe() {
             try? FileManager.default.removeItem(at: inputURL)
             try? FileManager.default.removeItem(at: URL(fileURLWithPath: outputBase.path + ".txt"))
         }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: whisperBinPath)
-        process.arguments = ["-f", inputURL.path, "-m", chosenModelPath, "-otxt", "-of", outputBase.path, "-np", "--no-timestamps", "-l", "auto"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
         var text: String?
-        do {
-            try process.run()
-            process.waitUntilExit()
-            logDiagnostic("whisper-cli exited with status \(process.terminationStatus)")
-            if process.terminationStatus == 0 {
-                text = try? String(contentsOfFile: outputBase.path + ".txt", encoding: .utf8)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+        let primaryBinPath = whisperBinPath
+        var attempts: [(path: String, forceCPU: Bool)] = [(primaryBinPath, false), (primaryBinPath, true)]
+        if primaryBinPath != bundledWhisperBinPath {
+            attempts.append((bundledWhisperBinPath, true))
+        }
+        for attempt in attempts {
+            try? FileManager.default.removeItem(atPath: outputBase.path + ".txt")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: attempt.path)
+            process.arguments = (attempt.forceCPU ? ["-ng"] : []) + [
+                "-t", String(transcriptionThreadCount),
+                "-f", inputURL.path, "-m", chosenModelPath,
+                "-otxt", "-of", outputBase.path, "-np", "--no-timestamps", "-l", "auto"
+            ]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                process.waitUntilExit()
+                logDiagnostic("whisper-cli exited with status \(process.terminationStatus); cpu=\(attempt.forceCPU); path=\(attempt.path)")
+                if process.terminationStatus == 0 {
+                    text = try? String(contentsOfFile: outputBase.path + ".txt", encoding: .utf8)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    break
+                }
+            } catch {
+                logDiagnostic("whisper-cli failed to run at \(attempt.path): \(error.localizedDescription)")
             }
-        } catch {
-            logDiagnostic("whisper-cli failed to run: \(error.localizedDescription)")
         }
 
+        logKeyboardResources("after transcription")
         DispatchQueue.main.async {
             isTranscribing = false
             if let text = text, !text.isEmpty {
@@ -204,7 +239,11 @@ func stopAndTranscribe() {
                     statusItem.button?.toolTip = "WhisperMac — Hold Right ⌘ to record"
                 } else {
                     logDiagnostic("paste shortcut not sent; focused pid=\(focusedPID.map(String.init) ?? "none"), original pid=\(originalTargetPID.map(String.init) ?? "none"), post access=\(CGPreflightPostEventAccess())")
-                    showActivity("Text copied. Allow Accessibility for automatic paste.", color: .systemOrange)
+                    if focusedPID == getpid() {
+                        showActivity("Text copied. Select a field in another app before recording.", color: .systemOrange)
+                    } else {
+                        showActivity("Text copied. Check Accessibility for automatic paste.", color: .systemOrange)
+                    }
                     playSound("Basso")
                     statusItem.button?.toolTip = "WhisperMac — Text copied, but automatic paste was blocked"
                 }
@@ -244,12 +283,7 @@ func postPaste(to pid: pid_t) -> Bool {
     return true
 }
 
-func handleRightCommand(keyCode: UInt16, flags: UInt64, source: String) {
-    guard keyCode == rightCommandKeyCode else { return }
-    // The device-specific right Command bit distinguishes it from left Command.
-    let isDown = (flags & 0x10) != 0
-    guard isDown != isRightCommandDown else { return }
-    isRightCommandDown = isDown
+func handleRightCommand(isDown: Bool, source: String) {
     logDiagnostic("right Command \(isDown ? "pressed" : "released") via \(source)")
     if isDown && isEnabled && !isRecording && !isTranscribing {
         startRecording()
@@ -258,90 +292,21 @@ func handleRightCommand(keyCode: UInt16, flags: UInt64, source: String) {
     }
 }
 
-let callback: CGEventTapCallBack = { _, type, event, _ in
-    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
-    } else if type == .flagsChanged {
-        handleRightCommand(keyCode: UInt16(event.getIntegerValueField(.keyboardEventKeycode)), flags: event.flags.rawValue, source: "event tap")
-    }
-    return Unmanaged.passUnretained(event)
-}
-
-func setupKeyMonitors() {
-    globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { event in
-        handleRightCommand(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue), source: "global monitor")
-    }
-    localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
-        handleRightCommand(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue), source: "local monitor")
-        return event
-    }
-    logDiagnostic("NSEvent monitors connected: global=\(globalKeyMonitor != nil), local=\(localKeyMonitor != nil)")
-}
-
-func removeTap() {
-    if let source = tapRunLoopSource {
-        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
-        tapRunLoopSource = nil
-    }
-    eventTap = nil
-}
-
-func createTap() -> Bool {
-    removeTap()
-    isRightCommandDown = (CGEventSource.flagsState(.combinedSessionState).rawValue & 0x10) != 0
-    let mask = (1 << CGEventType.flagsChanged.rawValue)
-    guard let tap = CGEvent.tapCreate(
-        tap: .cgSessionEventTap,
-        place: .headInsertEventTap,
-        options: .listenOnly,
-        eventsOfInterest: CGEventMask(mask),
-        callback: callback,
-        userInfo: nil
-    ) else { return false }
-    eventTap = tap
-    let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-    tapRunLoopSource = source
-    CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
-    CGEvent.tapEnable(tap: tap, enable: true)
-    return true
-}
-
-func setupTap() {
-    if createTap() {
-        logDiagnostic("keyboard tap connected; Input Monitoring preflight=\(CGPreflightListenEventAccess())")
+func setupKeyboardMonitoring(retry: Bool = false) {
+    // Don't discard a queued release while a recording is still in progress.
+    guard !isRecording && !isTranscribing else { return }
+    if retry { keyboardMonitor.stop() }
+    let connected = keyboardMonitor.start()
+    logDiagnostic("keyboard monitors connected=\(connected); backend=AppKit")
+    logKeyboardResources("setup")
+    if connected {
         showActivity("Ready — hold Right ⌘ to record", color: .systemGreen)
-        if !isRecording && !isTranscribing { setIcon("waveform.circle") }
+        setIcon("waveform.circle")
         statusItem.button?.toolTip = "WhisperMac — Hold Right ⌘ to record"
     } else {
-        let canListen = CGPreflightListenEventAccess()
-        logDiagnostic("keyboard tap unavailable: could not create tap; Input Monitoring preflight=\(canListen)")
-        showActivity("Shortcut unavailable — check Input Monitoring", color: .systemRed)
+        showActivity("Shortcut unavailable — check Accessibility", color: .systemRed)
         setIcon("exclamationmark.circle")
-        statusItem.button?.toolTip = canListen
-            ? "WhisperMac — Could not connect keyboard shortcut"
-            : "WhisperMac — Allow Input Monitoring in System Settings"
-    }
-}
-
-func checkTapHealth() {
-    guard let tap = eventTap else {
-        _ = createTap()
-        if eventTap != nil {
-            if !isRecording && !isTranscribing { setIcon("waveform.circle") }
-            statusItem.button?.toolTip = "WhisperMac — Hold Right ⌘ to record"
-        }
-        return
-    }
-    if !CGEvent.tapIsEnabled(tap: tap) {
-        CGEvent.tapEnable(tap: tap, enable: true)
-        if !CGEvent.tapIsEnabled(tap: tap) {
-            removeTap()
-            _ = createTap()
-            if eventTap != nil {
-                if !isRecording && !isTranscribing { setIcon("waveform.circle") }
-                statusItem.button?.toolTip = "WhisperMac — Hold Right ⌘ to record"
-            }
-        }
+        statusItem.button?.toolTip = "WhisperMac — Allow Accessibility and retry"
     }
 }
 
@@ -453,12 +418,12 @@ class PrefsWindow: NSObject, NSWindowDelegate {
 
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 390))
 
-        activityLabel = NSTextField(labelWithString: eventTap == nil
-            ? "Shortcut unavailable — check Input Monitoring"
+        activityLabel = NSTextField(labelWithString: !keyboardMonitor.isConnected
+            ? "Shortcut unavailable — check Accessibility"
             : "Ready — hold Right ⌘ to record")
         activityLabel.frame = NSRect(x: 20, y: 349, width: 420, height: 22)
         activityLabel.font = NSFont.boldSystemFont(ofSize: 13)
-        activityLabel.textColor = eventTap == nil ? .systemRed : .systemGreen
+        activityLabel.textColor = !keyboardMonitor.isConnected ? .systemRed : .systemGreen
         content.addSubview(activityLabel)
 
         permissionsLabel = NSTextField(labelWithString: "")
@@ -555,14 +520,14 @@ class PrefsWindow: NSObject, NSWindowDelegate {
 
     func refreshPermissions() {
         guard let permissionsLabel else { return }
-        let keyboard = eventTap == nil ? "unavailable" : "connected"
+        let keyboard = !keyboardMonitor.isConnected ? "unavailable" : "connected"
         let paste = AXIsProcessTrusted() ? "allowed" : "needs access"
         let microphone = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized ? "allowed" : "needs access"
         permissionsLabel.stringValue = "Shortcut: \(keyboard)   Paste: \(paste)   Mic: \(microphone)"
     }
 
     @objc func retryConnection() {
-        setupTap()
+        setupKeyboardMonitoring(retry: true)
         refreshPermissions()
     }
 
@@ -677,7 +642,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func retryTap() {
         if !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
-        setupTap()
+        setupKeyboardMonitoring(retry: true)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -685,7 +650,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         loadPreferences()
         activityWindow = prefs
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
-        logDiagnostic("app launched; model=\(selectedModel.filename); Input Monitoring=\(CGPreflightListenEventAccess()); post access=\(CGPreflightPostEventAccess()); microphone=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)")
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        logDiagnostic("app launched; version=\(version) build=\(build) pid=\(getpid()); model=\(selectedModel.filename); Input Monitoring=\(CGPreflightListenEventAccess()); post access=\(CGPreflightPostEventAccess()); microphone=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)")
         if !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
         if !CGPreflightPostEventAccess() { _ = CGRequestPostEventAccess() }
 
@@ -713,10 +680,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
 
-        setupTap()
-        setupKeyMonitors()
-        tapHealthTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in checkTapHealth() }
+        setupKeyboardMonitoring(retry: true)
         prefs.show()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        keyboardMonitor.stop()
+        audioRecorder?.stop()
+        audioRecorder = nil
+        if let url = recordingURL { try? FileManager.default.removeItem(at: url) }
+        recordingURL = nil
+        downloadSession?.cancel()
+        downloadSession = nil
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

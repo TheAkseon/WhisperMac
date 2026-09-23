@@ -2,10 +2,12 @@
 set -euo pipefail
 
 BUILD_DMG=0
+ENGINE_ONLY=0
 case "${1:-}" in
     ""|--no-dmg) ;;
     --app-only-dmg) BUILD_DMG=1 ;;
-    *) echo "Usage: $0 [--no-dmg|--app-only-dmg]" >&2; exit 2 ;;
+    --engine-only) ENGINE_ONLY=1 ;;
+    *) echo "Usage: $0 [--no-dmg|--app-only-dmg|--engine-only]" >&2; exit 2 ;;
 esac
 
 WHISPERMAC_DIR="$HOME/.whispermac"
@@ -17,6 +19,16 @@ CMAKE_DIR="$WHISPERMAC_DIR/cmake"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 WHISPERCPP_COMMIT="307869af285d7f6f689ba100b3515e2d1b3feb05"
 WHISPERCPP_URL="https://github.com/ggml-org/whisper.cpp.git"
+
+if [ "$ENGINE_ONLY" -eq 1 ]; then
+    EXISTING_APP=/Applications/WhisperMac.app
+    if [ ! -d "$EXISTING_APP" ]; then EXISTING_APP="$HOME/Applications/WhisperMac.app"; fi
+    EXISTING_VERSION=$(plutil -extract CFBundleVersion raw -o - "$EXISTING_APP/Contents/Info.plist" 2>/dev/null || true)
+    if [[ ! "$EXISTING_VERSION" =~ ^[0-9]+$ ]] || [ "$EXISTING_VERSION" -lt 2 ]; then
+        echo "--engine-only requires WhisperMac 1.1 or newer. Run bash install.sh once first." >&2
+        exit 1
+    fi
+fi
 
 cmake_is_compatible() {
     local version major minor remainder
@@ -94,11 +106,14 @@ cd "$WHISPERCPP_DIR"
 BUILD_LOG="$WHISPERMAC_DIR/build.log"
 CPU_COUNT=$(sysctl -n hw.ncpu 2>/dev/null || getconf NPROCESSORS_ONLN 2>/dev/null || echo 4)
 if [ "$CPU_COUNT" -gt 4 ]; then CPU_COUNT=4; fi
+METAL_MODE=OFF
+if [ "$(uname -m)" = arm64 ]; then METAL_MODE=ON; fi
 if ! "$CMAKE_BIN" -B build -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_ARCHITECTURES="$(uname -m)" \
     -DWHISPER_COREML=OFF \
     -DBUILD_SHARED_LIBS=OFF \
-    -DGGML_METAL=OFF \
+    -DGGML_METAL="$METAL_MODE" \
+    -DGGML_METAL_EMBED_LIBRARY=ON \
     -DGGML_ACCELERATE=ON \
     > "$BUILD_LOG" 2>&1; then
     tail -40 "$BUILD_LOG" >&2
@@ -108,9 +123,10 @@ if ! "$CMAKE_BIN" --build build -j"$CPU_COUNT" --target whisper-cli >> "$BUILD_L
     tail -40 "$BUILD_LOG" >&2
     exit 1
 fi
-cp build/bin/whisper-cli "$BIN_DIR/whisper-cli"
+install -m 755 build/bin/whisper-cli "$BIN_DIR/.whisper-cli.new"
+mv -f "$BIN_DIR/.whisper-cli.new" "$BIN_DIR/whisper-cli"
 cd "$REPO_DIR"
-echo "[3/5] whisper-cli OK"
+echo "[3/5] whisper-cli OK (Metal: $METAL_MODE)"
 
 # ─── Step 4: Download model ─────────────────────────────────────
 MODEL_NAME="ggml-medium.bin"
@@ -130,6 +146,12 @@ if [ ! -f "$MODEL_PATH" ] || [ "$(shasum -a 256 "$MODEL_PATH" | awk '{ print $1 
 fi
 echo "[4/5] Model OK"
 
+if [ "$ENGINE_ONLY" -eq 1 ]; then
+    echo "Engine updated at $BIN_DIR/whisper-cli. The installed app was not replaced."
+    echo "This mode requires an app version that reads the external engine."
+    exit 0
+fi
+
 # ─── Step 5: Build WhisperMac.app ───────────────────────────────
 echo "[5/5] Building WhisperMac.app..."
 cd "$REPO_DIR"
@@ -144,7 +166,7 @@ swiftc -o "build/WhisperMac.app/Contents/MacOS/WhisperMac" \
     -module-cache-path "$WHISPERMAC_DIR/swift-module-cache" \
     -Xcc "-fmodules-cache-path=$WHISPERMAC_DIR/clang-module-cache" \
     -O -whole-module-optimization \
-    Sources/main.swift
+    Sources/*.swift
 
 cp "$BIN_DIR/whisper-cli" "build/WhisperMac.app/Contents/Resources/whisper-cli"
 chmod +x "build/WhisperMac.app/Contents/Resources/whisper-cli"
@@ -164,9 +186,9 @@ cat > "build/WhisperMac.app/Contents/Info.plist" << 'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>3</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.2</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>WhisperMac needs microphone access to transcribe your voice.</string>
     <key>NSSupportsAutomaticTermination</key>
@@ -201,7 +223,7 @@ else
 fi
 INSTALLED_APP="$INSTALL_DIR/WhisperMac.app"
 STAGED_APP="$INSTALL_DIR/.WhisperMac.app.new"
-BACKUP_APP="$INSTALL_DIR/.WhisperMac.app.previous"
+BACKUP_APP="$INSTALL_DIR/.WhisperMac.app.previous.$(date +%Y%m%d%H%M%S).$$"
 SERVICE_TARGET="gui/$(id -u)/com.whispermac"
 rm -rf "$STAGED_APP"
 cp -R "$APP_DIR" "$STAGED_APP"
@@ -214,7 +236,7 @@ if launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
     fi
 fi
 killall WhisperMac 2>/dev/null || true
-rm -rf "$BACKUP_APP"
+# Keep the previous app until the new build is verified in a normal user session.
 if [ -d "$INSTALLED_APP" ]; then
     mv "$INSTALLED_APP" "$BACKUP_APP"
 fi
@@ -224,8 +246,6 @@ if ! mv "$STAGED_APP" "$INSTALLED_APP"; then
     fi
     exit 1
 fi
-rm -rf "$BACKUP_APP"
-
 # ─── LaunchAgent ─────────────────────────────────────────────────
 PLIST_PATH="$HOME/Library/LaunchAgents/com.whispermac.plist"
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -267,6 +287,9 @@ echo "         WhisperMac — INSTALLED"
 echo "================================================"
 echo ""
 echo "  App:      $INSTALLED_APP"
+if [ -d "$BACKUP_APP" ]; then
+    echo "  Backup:   $BACKUP_APP"
+fi
 if [ "$BUILD_DMG" -eq 1 ]; then
     echo "  DMG:      $REPO_DIR/WhisperMac.dmg"
 fi
