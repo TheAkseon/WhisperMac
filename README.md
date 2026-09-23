@@ -1,22 +1,54 @@
 # WhisperMac
 
-WhisperMac is a macOS app with a Dock icon and a status window. It records while the right Command key is held, transcribes locally with `whisper.cpp`, and pastes the result into the focused app.
+WhisperMac записывает речь, пока вы держите **правый ⌘ Command**, распознаёт её локально и вставляет текст в активное поле ввода после отпускания клавиши. Приложение продолжает работать, когда его окно свёрнуто или закрыто.
 
-## Install
+## Установка на новом Mac
 
-On a Mac with Xcode Command Line Tools, run `./install.sh`. The script builds `whisper.cpp`, downloads the multilingual medium model (about 1.5 GB), builds and signs the app, creates `WhisperMac.dmg`, installs it in `/Applications`, and creates a login agent.
+Понадобятся интернет и несколько гигабайт свободного места: одна только модель занимает около **1,5 ГБ**. Homebrew и заранее установленный CMake не нужны. Установщик собирает программу под процессор данного Mac.
 
-Use `./install.sh --no-dmg` if you only need the installed app and cannot create a disk image in your environment.
+1. Откройте [репозиторий WhisperMac](https://github.com/TheAkseon/WhisperMac), нажмите **Code → Download ZIP** и распакуйте архив. Если Git уже установлен, можно вместо этого клонировать репозиторий.
+2. Откройте приложение **Терминал** через Spotlight (`⌘ Пробел` → «Терминал»).
+3. Наберите `cd ` с пробелом, перетащите **распакованную папку WhisperMac** из Finder в окно Терминала и нажмите Return. Терминал перейдёт в нужную папку.
+4. Выполните:
 
-Allow **Microphone**, **Input Monitoring**, and **Accessibility** access for WhisperMac in System Settings → Privacy & Security. The global right Command shortcut needs Input Monitoring; automatic paste needs Accessibility. Because the app is signed locally, replacing it can invalidate a saved permission. If the status window still says `needs access` while the switch is on, remove WhisperMac from that permission list, open the installed app again, enable the new entry, and click **Retry**.
+   ```bash
+   bash install.sh
+   ```
 
-Open WhisperMac from the Dock to see shortcut, paste, microphone, and model status or to change the model. Hold right Command to record, then release it to transcribe. Wait for the completion sound before starting another recording. The app keeps running when its window is closed.
+5. Если macOS предложит установить **Xcode Command Line Tools**, подтвердите установку и дождитесь её завершения. После этого **повторите `bash install.sh`** в той же папке. При первом запуске скрипт скачает CMake при необходимости, исходники `whisper.cpp` и модель на 1,5 ГБ. Это может занять время в зависимости от интернета и Mac.
+6. Дождитесь сообщения **`WhisperMac — INSTALLED`**. Установщик покажет путь к приложению в строке `App:`. Обычно это `/Applications/WhisperMac.app`; если запись в `/Applications` недоступна, используется `~/Applications/WhisperMac.app`.
 
-## Troubleshooting
+Установщик скачивает модель **до запуска приложения** в `~/.whispermac/models/ggml-medium.bin`, проверяет её контрольную сумму, собирает `whisper-cli`, помещает его внутрь приложения и настраивает запуск при входе в macOS.
 
-- If the window says the shortcut is unavailable, check Input Monitoring permission and click **Retry**.
-- If automatic paste is blocked, check Accessibility permission for WhisperMac. The result remains in the clipboard.
-- If recording does not start, check Microphone permission and ensure the selected model is marked ready in Preferences.
-- The installer writes process output to `~/.whispermac/stdout.log` and `~/.whispermac/stderr.log`.
-- The app writes startup, keyboard, recording, and transcription status to `~/.whispermac/debug.log` without recording the recognized text.
-- Re-running `./install.sh` reuses the existing model and `whisper.cpp` checkout when valid.
+### Разрешения при первом запуске
+
+Откройте WhisperMac, если его окно не появилось само. В окне приложения есть статусы **Shortcut**, **Paste** и **Mic**. Нужны три разрешения в **Системные настройки → Конфиденциальность и безопасность**:
+
+1. **Микрофон / Microphone.** Когда macOS покажет запрос, нажмите «Разрешить». Если ранее отказали, включите WhisperMac в разделе «Микрофон».
+2. **Мониторинг ввода / Input Monitoring.** Нажмите в WhisperMac кнопку **Input Monitoring**: она откроет нужный раздел настроек. Включите переключатель напротив WhisperMac. Это нужно, чтобы правый ⌘ работал в других приложениях и при свёрнутом окне.
+3. **Универсальный доступ / Accessibility.** Нажмите кнопку **Accessibility**, затем включите WhisperMac в открывшемся разделе. Это разрешение нужно для автоматической вставки текста в поле с курсором.
+
+**Кнопки только открывают настройки; разрешения выдаёт сам владелец Mac.** macOS может попросить Touch ID или пароль. Если WhisperMac отсутствует в списке, нажмите `+` и выберите приложение по пути из строки `App:` установщика. После выдачи разрешений нажмите **Retry**. Если статус не обновился, нажмите правой кнопкой на значок WhisperMac в Dock, выберите **Завершить** и откройте приложение снова: простое закрытие окна не завершает процесс. Проверьте в окне: `Shortcut: connected`, `Paste: allowed`, `Mic: allowed`, а под выбором модели — `Model ready`.
+
+### Проверка
+
+1. Откройте **TextEdit** и поставьте курсор в пустой документ.
+2. Удерживайте **правый ⌘**, произнесите фразу и отпустите клавишу. Запись должна идти всё время, пока клавиша нажата.
+3. Дождитесь окончания распознавания. Текст должен появиться там, где стоял курсор, **без ручного ⌘V**. Он также сохраняется в буфере обмена.
+4. Сверните окно WhisperMac и повторите проверку: фоновая запись должна продолжать работать.
+
+Чтобы WhisperMac запускался после входа в систему, проверьте **Системные настройки → Основные → Объекты входа и расширения**. Установщик создаёт агент автозапуска; WhisperMac должен быть разрешён в объектах входа или фоновой активности.
+
+## Если что-то не работает
+
+- **Нет записи по правому ⌘:** проверьте `Shortcut: connected`, разрешение «Мониторинг ввода» и флажок **Enable (Right ⌘ to record)** в окне WhisperMac. Нажмите **Retry** или перезапустите приложение.
+- **Запись есть, текста нет:** проверьте `Mic: allowed` и `Model ready`. Если модель отсутствует, нажмите **Download** в окне приложения. Если скачивание прервалось, проверьте интернет и свободное место.
+- **Текст попадает в буфер, но не вставляется:** проверьте `Paste: allowed` и разрешение «Универсальный доступ». После обновления приложения macOS иногда сохраняет старую запись разрешения: удалите WhisperMac из списка «Универсальный доступ», откройте установленное приложение, добавьте его снова и включите переключатель. Затем перезапустите WhisperMac.
+- **Установщик сообщил `launchctl bootstrap ... error 5`:** приложение уже установлено. Откройте `/Applications/WhisperMac.app` через Finder; если его там нет, проверьте `~/Applications/WhisperMac.app`. Затем проверьте раздел «Объекты входа и расширения». Запуск установщика через некоторые среды автоматизации может мешать `launchctl`; `sudo launchctl` для обычной установки не требуется.
+- **Нужны подробности ошибки:** смотрите `~/.whispermac/build.log`, `~/.whispermac/stderr.log` и `~/.whispermac/debug.log`. Журнал приложения записывает этапы работы, но не сохраняет распознанный текст.
+
+Для обновления скачайте свежий репозиторий и снова выполните `bash install.sh`. Модель повторно не скачивается, если её контрольная сумма верна. Приложение подписывается локально, поэтому после обновления macOS может потребовать заново включить разрешения.
+
+## Почему нельзя просто установить DMG
+
+**DMG не входит в скачанный репозиторий** и не является готовым установщиком для другого Mac. Команда `bash install.sh --app-only-dmg` создаёт отдельный DMG только с приложением и `whisper-cli`, **без модели**. Если перенести один такой DMG, модель придётся скачивать кнопкой **Download** внутри приложения, а автозапуск настраивать отдельно. Для первого использования на новом Mac применяйте шаги установки выше.

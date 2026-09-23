@@ -1,11 +1,11 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-BUILD_DMG=1
+BUILD_DMG=0
 case "${1:-}" in
-    "") ;;
-    --no-dmg) BUILD_DMG=0 ;;
-    *) echo "Usage: $0 [--no-dmg]" >&2; exit 2 ;;
+    ""|--no-dmg) ;;
+    --app-only-dmg) BUILD_DMG=1 ;;
+    *) echo "Usage: $0 [--no-dmg|--app-only-dmg]" >&2; exit 2 ;;
 esac
 
 WHISPERMAC_DIR="$HOME/.whispermac"
@@ -15,6 +15,18 @@ APP_DIR="$WHISPERMAC_DIR/WhisperMac.app"
 WHISPERCPP_DIR="$WHISPERMAC_DIR/whisper.cpp"
 CMAKE_DIR="$WHISPERMAC_DIR/cmake"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+WHISPERCPP_COMMIT="307869af285d7f6f689ba100b3515e2d1b3feb05"
+WHISPERCPP_URL="https://github.com/ggml-org/whisper.cpp.git"
+
+cmake_is_compatible() {
+    local version major minor remainder
+    version=$("$1" --version | awk 'NR == 1 { print $3 }') || return 1
+    major=${version%%.*}
+    remainder=${version#*.}
+    minor=${remainder%%.*}
+    [[ $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]] || return 1
+    (( major > 3 || (major == 3 && minor >= 14) ))
+}
 
 echo "================================================"
 echo "         WhisperMac Installer"
@@ -29,47 +41,61 @@ if ! xcode-select -p &>/dev/null; then
     echo "      Click Install in the popup, wait, then run ./install.sh again."
     exit 1
 fi
+for tool in git swiftc clang curl codesign shasum; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "Missing $tool. Finish installing Xcode Command Line Tools, then run ./install.sh again." >&2
+        exit 1
+    fi
+done
 echo "[1/5] OK"
 
 mkdir -p "$MODELS_DIR" "$BIN_DIR" "$CMAKE_DIR"
 
 # ─── Step 2: cmake ──────────────────────────────────────────────
 CMAKE_BIN=""
-if command -v cmake &>/dev/null; then
+if command -v cmake &>/dev/null && cmake_is_compatible cmake; then
     CMAKE_BIN="cmake"
     echo "[2/5] cmake: system"
-elif [ -x "$CMAKE_DIR/CMake.app/Contents/bin/cmake" ]; then
+elif [ -x "$CMAKE_DIR/CMake.app/Contents/bin/cmake" ] && cmake_is_compatible "$CMAKE_DIR/CMake.app/Contents/bin/cmake"; then
     CMAKE_BIN="$CMAKE_DIR/CMake.app/Contents/bin/cmake"
     echo "[2/5] cmake: cached"
 else
     echo "[2/5] Downloading cmake..."
     CMAKE_VERSION="3.30.6"
+    CMAKE_ARCHIVE="$CMAKE_DIR/cmake-${CMAKE_VERSION}-macos-universal.tar.gz"
     curl -fL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-macos-universal.tar.gz" \
-         -o /tmp/cmake.tar.gz
-    rm -rf "$CMAKE_DIR"
-    mkdir -p "$CMAKE_DIR"
-    tar xzf /tmp/cmake.tar.gz -C "$CMAKE_DIR" --strip-components=1
+         --retry 3 --retry-delay 3 -o "$CMAKE_ARCHIVE"
+    tar xzf "$CMAKE_ARCHIVE" -C "$CMAKE_DIR" --strip-components=1
     CMAKE_BIN="$CMAKE_DIR/CMake.app/Contents/bin/cmake"
     chmod +x "$CMAKE_BIN"
+    if ! cmake_is_compatible "$CMAKE_BIN"; then
+        echo "Downloaded cmake cannot run on this Mac." >&2
+        exit 1
+    fi
     echo "[2/5] cmake: OK"
 fi
 
 # ─── Step 3: Build whisper.cpp ──────────────────────────────────
 echo "[3/5] Building whisper.cpp..."
-if [ -d "$WHISPERCPP_DIR" ] && [ ! -f "$WHISPERCPP_DIR/ggml/include/ggml.h" ]; then
-    rm -rf "$WHISPERCPP_DIR"
+if [ ! -e "$WHISPERCPP_DIR" ]; then
+    mkdir -p "$WHISPERCPP_DIR"
+    git -C "$WHISPERCPP_DIR" init -q
+elif [ ! -d "$WHISPERCPP_DIR/.git" ]; then
+    echo "$WHISPERCPP_DIR exists but is not a Git checkout. Move it aside and retry." >&2
+    exit 1
 fi
-if [ ! -d "$WHISPERCPP_DIR" ]; then
-    git clone --depth 1 https://github.com/ggerganov/whisper.cpp.git "$WHISPERCPP_DIR"
+if [ "$(git -C "$WHISPERCPP_DIR" rev-parse HEAD 2>/dev/null || true)" != "$WHISPERCPP_COMMIT" ]; then
+    git -C "$WHISPERCPP_DIR" fetch --depth 1 "$WHISPERCPP_URL" "$WHISPERCPP_COMMIT"
+    git -C "$WHISPERCPP_DIR" checkout --detach -q FETCH_HEAD
 fi
+test "$(git -C "$WHISPERCPP_DIR" rev-parse HEAD)" = "$WHISPERCPP_COMMIT"
 
 cd "$WHISPERCPP_DIR"
 BUILD_LOG="$WHISPERMAC_DIR/build.log"
 CPU_COUNT=$(sysctl -n hw.ncpu 2>/dev/null || getconf NPROCESSORS_ONLN 2>/dev/null || echo 4)
+if [ "$CPU_COUNT" -gt 4 ]; then CPU_COUNT=4; fi
 if ! "$CMAKE_BIN" -B build -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_ARCHITECTURES="$(uname -m)" \
-    -DWHISPER_NO_AVX=ON -DWHISPER_NO_AVX2=ON \
-    -DWHISPER_NO_FMA=ON -DWHISPER_NO_F16C=ON \
     -DWHISPER_COREML=OFF \
     -DBUILD_SHARED_LIBS=OFF \
     -DGGML_METAL=OFF \
@@ -89,24 +115,18 @@ echo "[3/5] whisper-cli OK"
 # ─── Step 4: Download model ─────────────────────────────────────
 MODEL_NAME="ggml-medium.bin"
 MODEL_PATH="$MODELS_DIR/$MODEL_NAME"
-MODEL_MIN_BYTES=1400000000
+MODEL_SHA256="6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208"
+MODEL_DOWNLOAD="$MODEL_PATH.download"
 echo "[4/5] Downloading model $MODEL_NAME (~1.5 GB)..."
-if [ -f "$MODEL_PATH" ]; then
-    ACTUAL_SIZE=$(stat -f%z "$MODEL_PATH" 2>/dev/null || echo 0)
-    HEADER=$(od -An -tx1 -N4 "$MODEL_PATH" | tr -d ' \n')
-    if [ "$ACTUAL_SIZE" -lt "$MODEL_MIN_BYTES" ] || [ "$HEADER" != "6c6d6767" ]; then
-        rm -f "$MODEL_PATH"
-    fi
-fi
-if [ ! -f "$MODEL_PATH" ]; then
+if [ ! -f "$MODEL_PATH" ] || [ "$(shasum -a 256 "$MODEL_PATH" | awk '{ print $1 }')" != "$MODEL_SHA256" ]; then
     curl -fL -C - "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$MODEL_NAME" \
-         -o "$MODEL_PATH" --retry 3 --retry-delay 5
-fi
-ACTUAL_SIZE=$(stat -f%z "$MODEL_PATH")
-HEADER=$(od -An -tx1 -N4 "$MODEL_PATH" | tr -d ' \n')
-if [ "$ACTUAL_SIZE" -lt "$MODEL_MIN_BYTES" ] || [ "$HEADER" != "6c6d6767" ]; then
-    echo "Model download is incomplete or invalid" >&2
-    exit 1
+         -o "$MODEL_DOWNLOAD" --retry 3 --retry-delay 5
+    ACTUAL_HASH=$(shasum -a 256 "$MODEL_DOWNLOAD" | awk '{ print $1 }')
+    if [ "$ACTUAL_HASH" != "$MODEL_SHA256" ]; then
+        echo "Model checksum mismatch. Remove $MODEL_DOWNLOAD and retry." >&2
+        exit 1
+    fi
+    mv -f "$MODEL_DOWNLOAD" "$MODEL_PATH"
 fi
 echo "[4/5] Model OK"
 
@@ -167,13 +187,21 @@ cp -R "build/WhisperMac.app" "$APP_DIR"
 # ─── DMG ────────────────────────────────────────────────────────
 if [ "$BUILD_DMG" -eq 1 ]; then
     hdiutil create -volname WhisperMac -srcfolder build/WhisperMac.app -ov -format UDZO "$REPO_DIR/WhisperMac.dmg" > /dev/null
+    echo "This app-only DMG does not include the model. Use install.sh on another Mac." >&2
 fi
 
 echo "[5/5] WhisperMac.app OK"
 
 # ─── Install to /Applications ───────────────────────────────────
-STAGED_APP="/Applications/.WhisperMac.app.new"
-BACKUP_APP="/Applications/.WhisperMac.app.previous"
+if [ -w /Applications ]; then
+    INSTALL_DIR="/Applications"
+else
+    INSTALL_DIR="$HOME/Applications"
+    mkdir -p "$INSTALL_DIR"
+fi
+INSTALLED_APP="$INSTALL_DIR/WhisperMac.app"
+STAGED_APP="$INSTALL_DIR/.WhisperMac.app.new"
+BACKUP_APP="$INSTALL_DIR/.WhisperMac.app.previous"
 SERVICE_TARGET="gui/$(id -u)/com.whispermac"
 rm -rf "$STAGED_APP"
 cp -R "$APP_DIR" "$STAGED_APP"
@@ -187,12 +215,12 @@ if launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
 fi
 killall WhisperMac 2>/dev/null || true
 rm -rf "$BACKUP_APP"
-if [ -d /Applications/WhisperMac.app ]; then
-    mv /Applications/WhisperMac.app "$BACKUP_APP"
+if [ -d "$INSTALLED_APP" ]; then
+    mv "$INSTALLED_APP" "$BACKUP_APP"
 fi
-if ! mv "$STAGED_APP" /Applications/WhisperMac.app; then
+if ! mv "$STAGED_APP" "$INSTALLED_APP"; then
     if [ -d "$BACKUP_APP" ]; then
-        mv "$BACKUP_APP" /Applications/WhisperMac.app
+        mv "$BACKUP_APP" "$INSTALLED_APP"
     fi
     exit 1
 fi
@@ -212,7 +240,7 @@ cat > "$PLIST_PATH" << EOF
     <string>com.whispermac</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/WhisperMac.app/Contents/MacOS/WhisperMac</string>
+        <string>${INSTALLED_APP}/Contents/MacOS/WhisperMac</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -227,8 +255,9 @@ EOF
 launchctl enable "$SERVICE_TARGET"
 if ! launchctl bootstrap gui/"$(id -u)" "$PLIST_PATH"; then
     echo "The login agent could not start in this session; trying to open WhisperMac normally." >&2
-    if ! open /Applications/WhisperMac.app; then
-        echo "Open /Applications/WhisperMac.app in Finder. The login agent remains installed for the next login." >&2
+    if ! open "$INSTALLED_APP"; then
+        echo "Installed but could not start. Open $INSTALLED_APP in Finder; the login agent remains installed for the next login." >&2
+        exit 1
     fi
 fi
 
@@ -237,7 +266,7 @@ echo "================================================"
 echo "         WhisperMac — INSTALLED"
 echo "================================================"
 echo ""
-echo "  App:      /Applications/WhisperMac.app"
+echo "  App:      $INSTALLED_APP"
 if [ "$BUILD_DMG" -eq 1 ]; then
     echo "  DMG:      $REPO_DIR/WhisperMac.dmg"
 fi
