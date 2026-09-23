@@ -1,0 +1,8 @@
+build/
+WhisperMac.dmg
+.xcodeproj/
+.xcworkspace/
+*.xcuserdata/
+.DS_Store
+._*
+WhisperMac.app/
